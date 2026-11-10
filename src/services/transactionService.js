@@ -1,11 +1,11 @@
-const { Transaction, Category, Vendor, User } = require('../models');
+const { Transaction, Category, Vendor, User, DailyDaybook } = require('../models');
 const { Op, fn, col, literal } = require('sequelize');
 const { NotFoundError, ValidationError } = require('../utils/AppError');
 const { getPagination, buildMeta, getSortOrder } = require('../utils/pagination');
 const { generateVoucherNo } = require('../utils/voucher');
 const sequelize = require('../config/database');
 
-const SORTABLE = ['transaction_date', 'amount', 'created_at'];
+const SORTABLE = ['transaction_date', 'amount', 'created_at', 'id'];
 
 const INCLUDE_REFS = [
   { model: Category, as: 'category', attributes: ['id', 'name', 'type'] },
@@ -15,7 +15,7 @@ const INCLUDE_REFS = [
 
 const list = async (query) => {
   const { page, limit, offset } = getPagination(query);
-  const order = getSortOrder(query, SORTABLE, 'transaction_date');
+  const order = getSortOrder(query, SORTABLE, 'transaction_date', 'id');
 
   const where = {};
   if (query.category_id)    where.category_id    = query.category_id;
@@ -56,15 +56,26 @@ const list = async (query) => {
  *   total_expense    = all EXPENSE entries
  *   net              = total_commission + total_income - total_expense
  */
-const getSummary = async ({ from_date, to_date }) => {
-  const dateWhere = {
-    transaction_date: {
-      [Op.gte]: from_date,
-      [Op.lte]: to_date,
-    },
-  };
+const getSummary = async ({ from_date, to_date } = {}) => {
+  const dateWhere = {};
+  if (from_date && to_date) {
+    dateWhere.transaction_date = { [Op.gte]: from_date, [Op.lte]: to_date };
+  } else if (from_date) {
+    dateWhere.transaction_date = { [Op.gte]: from_date };
+  } else if (to_date) {
+    dateWhere.transaction_date = { [Op.lte]: to_date };
+  }
 
-  const [byTypeAndRef, byMode, investRows] = await Promise.all([
+  const daybookWhere = {};
+  if (from_date && to_date) {
+    daybookWhere.entry_date = { [Op.gte]: from_date, [Op.lte]: to_date };
+  } else if (from_date) {
+    daybookWhere.entry_date = { [Op.gte]: from_date };
+  } else if (to_date) {
+    daybookWhere.entry_date = { [Op.lte]: to_date };
+  }
+
+  const [byTypeAndRef, byMode, investRows, daybookRows] = await Promise.all([
     // Group by category type + reference_type to split fuel commission from other income
     Transaction.findAll({
       where:      dateWhere,
@@ -95,16 +106,32 @@ const getSummary = async ({ from_date, to_date }) => {
       raw:      true,
       subQuery: false,
     }),
+
+    // Fuel commission from DailyDaybook shifts
+    DailyDaybook.findAll({
+      where:      daybookWhere,
+      attributes: ['total_margin', 'ms_sold', 'ms_margin', 'hsd_sold', 'hsd_margin'],
+      raw:        true,
+    }),
   ]);
 
   let total_income = 0, total_commission = 0, total_expense = 0;
+
+  // Aggregate fuel commission from shifts
+  daybookRows.forEach((d) => {
+    const margin = parseFloat(d.total_margin || 0) ||
+      ((parseFloat(d.ms_sold || 0) * parseFloat(d.ms_margin || 3.50)) +
+       (parseFloat(d.hsd_sold || 0) * parseFloat(d.hsd_margin || 3.00)));
+    total_commission += margin;
+  });
+
   byTypeAndRef.forEach((r) => {
     const amt = parseFloat(r.total || 0);
     if (r.category_type === 'EXPENSE') {
       total_expense += amt;
     } else if (r.category_type === 'INCOME') {
       if (r.reference_type === 'FUEL') {
-        total_commission += amt;
+        if (daybookRows.length === 0) total_commission += amt;
       } else {
         total_income += amt;
       }

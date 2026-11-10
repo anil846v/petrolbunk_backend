@@ -43,7 +43,7 @@ const Transaction = sequelize.define('Transaction', {
   },
 
   reference_type: {
-    type: DataTypes.ENUM('FUEL', 'LOAN', 'MANUAL'),
+    type: DataTypes.ENUM('FUEL', 'LOAN', 'MANUAL', 'SHIFT_EXPENSE'),
     allowNull: false,
     defaultValue: 'MANUAL',
   },
@@ -75,11 +75,11 @@ const Transaction = sequelize.define('Transaction', {
   updatedAt: 'updated_at',
 
   indexes: [
-    { name: 'idx_transaction_date', fields: ['transaction_date'] },
-    { name: 'idx_transaction_vendor', fields: ['vendor_id'] },
-    { name: 'idx_transaction_category', fields: ['category_id'] },
-    { name: 'idx_reference', fields: ['reference_type', 'reference_id'] },
-    { name: 'idx_created_by', fields: ['created_by'] },
+    { name: 'idx_transactions_date', fields: ['transaction_date'] },
+    { name: 'idx_transactions_category', fields: ['category_id'] },
+    { name: 'idx_transactions_vendor', fields: ['vendor_id'] },
+    { name: 'idx_transactions_voucher', unique: true, fields: ['voucher_no'] },
+    { name: 'idx_transactions_ref', fields: ['reference_type', 'reference_id'] },
   ],
 });
 

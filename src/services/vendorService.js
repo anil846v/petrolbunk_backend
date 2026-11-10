@@ -3,11 +3,11 @@ const { Op } = require('sequelize');
 const { NotFoundError, ConflictError } = require('../utils/AppError');
 const { getPagination, buildMeta, getSortOrder } = require('../utils/pagination');
 
-const SORTABLE = ['name', 'type', 'created_at'];
+const SORTABLE = ['name', 'type', 'created_at', 'id'];
 
 const list = async (query) => {
   const { page, limit, offset } = getPagination(query);
-  const order = getSortOrder(query, SORTABLE, 'name');
+  const order = getSortOrder(query, SORTABLE, 'created_at', 'id');
 
   const where = {};
   if (query.type)                    where.type      = query.type;

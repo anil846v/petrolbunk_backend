@@ -28,4 +28,25 @@ const getMe = async (req, res) => {
     return sendSuccess(res, user, 'User fetched successfully');
 };
 
-module.exports = { login, logout, getMe };
+// POST /api/v1/auth/forgot-password
+const forgotPassword = async (req, res) => {
+    const { email } = req.body;
+    const result = await authService.forgotPassword(email);
+    return sendSuccess(res, result, 'Verification code has been sent to your registered email.');
+};
+
+// POST /api/v1/auth/verify-otp
+const verifyOtp = async (req, res) => {
+    const { email, otp } = req.body;
+    const result = await authService.verifyOtp({ email, otp });
+    return sendSuccess(res, result, 'Verification code confirmed. You can now set a new password.');
+};
+
+// POST /api/v1/auth/reset-password
+const resetPassword = async (req, res) => {
+    const { email, otp, new_password } = req.body;
+    const result = await authService.resetPassword({ email, otp, new_password });
+    return sendSuccess(res, result, 'Password reset successful. You can now login with your new password.');
+};
+
+module.exports = { login, logout, getMe, forgotPassword, verifyOtp, resetPassword };

@@ -21,13 +21,13 @@ const create = async (req, res) => {
 
 // PUT /api/v1/users/:id
 const update = async (req, res) => {
-    const user = await userService.update(req.params.id, req.body);
+    const user = await userService.update(req.params.id, req.body, req.user?.id);
     return sendSuccess(res, user, 'User updated successfully');
 };
 
 // PATCH /api/v1/users/:id/toggle-status
 const toggleStatus = async (req, res) => {
-    const user = await userService.toggleStatus(req.params.id);
+    const user = await userService.toggleStatus(req.params.id, req.user?.id);
     const msg  = user.is_active ? 'User activated' : 'User deactivated';
     return sendSuccess(res, user, msg);
 };

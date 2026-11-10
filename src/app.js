@@ -7,22 +7,21 @@ const cookieParser = require('cookie-parser');
 
 require('dotenv').config();
 
-const morgan   = require('morgan');
-const logger   = require('./utils/logger');
-const AppError = require('./utils/AppError');
+const morgan     = require('morgan');
+const logger     = require('./utils/logger');
+const AppError   = require('./utils/AppError');
+const { apiLimiter } = require('./middleware/rateLimiter');
 
 const authRoutes            = require('./routes/authRoutes');
 const userRoutes            = require('./routes/userRoutes');
 const categoryRoutes        = require('./routes/categoryRoutes');
 const vendorRoutes          = require('./routes/vendorRoutes');
-const fuelTypeRoutes        = require('./routes/fuelTypeRoutes');
-const fuelSaleRoutes        = require('./routes/fuelSaleRoutes');
 const transactionRoutes     = require('./routes/transactionRoutes');
 const loanRoutes            = require('./routes/loanRoutes');
 const loanTransactionRoutes = require('./routes/loanTransactionRoutes');
 const dashboardRoutes       = require('./routes/dashboardRoutes');
 const reportRoutes          = require('./routes/reportRoutes');
-
+const dailyDaybookRoutes    = require('./routes/dailyDaybookRoutes');
 
 const app = express();
 
@@ -44,11 +43,23 @@ app.use(
     })
 );
 
-// CORS
+// Apply API Rate Limiter
+app.use('/api/', apiLimiter);
+
+// CORS Configuration
+const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
+    .split(',')
+    .map(o => o.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+
 const corsOptions = {
-    origin:
-        process.env.FRONTEND_URL ||
-        'http://localhost:5173',
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps, curl, or same-origin)
+        if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+            return callback(null, true);
+        }
+        return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
     credentials: true,
     methods: [
         'GET',
@@ -87,12 +98,11 @@ app.use(hpp());
    ROUTES
 ========================= */
 
+app.use('/api/v1/daily-daybook',     dailyDaybookRoutes);
 app.use('/api/v1/auth',              authRoutes);
 app.use('/api/v1/users',             userRoutes);
 app.use('/api/v1/categories',        categoryRoutes);
 app.use('/api/v1/vendors',           vendorRoutes);
-app.use('/api/v1/fuel-types',        fuelTypeRoutes);
-app.use('/api/v1/fuel-sales',        fuelSaleRoutes);
 app.use('/api/v1/transactions',      transactionRoutes);
 app.use('/api/v1/loans',             loanRoutes);
 app.use('/api/v1/loan-transactions', loanTransactionRoutes);
@@ -107,8 +117,7 @@ app.use('/api/v1/reports',           reportRoutes);
 app.get('/api/health', (req, res) => {
     res.status(200).json({
         success: true,
-        message:
-            'PetrolBunk API Running Successfully',
+        message: 'PetrolBunk API Running Successfully',
     });
 });
 

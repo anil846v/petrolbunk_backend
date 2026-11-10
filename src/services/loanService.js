@@ -1,15 +1,22 @@
-const { Loan, LoanTransaction, Vendor } = require('../models');
-const { Op, fn, col, literal } = require('sequelize');
+const { Loan, Transaction, Category, Vendor } = require('../models');
+const { Op } = require('sequelize');
 const { NotFoundError, ValidationError } = require('../utils/AppError');
 const { getPagination, buildMeta, getSortOrder } = require('../utils/pagination');
 
-const SORTABLE = ['start_date', 'principal_amount', 'created_at'];
+const SORTABLE = ['start_date', 'principal_amount', 'created_at', 'id'];
 
 const INCLUDE_VENDOR = [{ model: Vendor, as: 'vendor', attributes: ['id', 'name', 'phone', 'type'] }];
 
+const isRepayment = (txn, loanType) => {
+  if (txn.description && txn.description.includes('[REPAYMENT]')) return true;
+  if (txn.description && txn.description.includes('[DISBURSEMENT]')) return false;
+  if (loanType === 'GIVEN') return txn.category?.type === 'INCOME';
+  return txn.category?.type === 'EXPENSE';
+};
+
 const list = async (query) => {
   const { page, limit, offset } = getPagination(query);
-  const order = getSortOrder(query, SORTABLE, 'created_at');
+  const order = getSortOrder(query, SORTABLE, 'created_at', 'id');
 
   const where = {};
   if (query.loan_type) where.loan_type = query.loan_type;
@@ -29,9 +36,7 @@ const list = async (query) => {
 };
 
 /**
- * Outstanding — all ACTIVE loans with their computed pending balance.
- * Balance = principal - SUM(repayments) for GIVEN loans.
- * Balance = SUM(disbursements) - SUM(repayments) for TAKEN loans.
+ * Outstanding — all ACTIVE loans with their computed pending balance from unified transactions.
  */
 const getOutstanding = async (query) => {
   const { page, limit, offset } = getPagination(query);
@@ -43,20 +48,35 @@ const getOutstanding = async (query) => {
     where, limit, offset,
     include: [
       ...INCLUDE_VENDOR,
-      { model: LoanTransaction, as: 'loanTransactions', attributes: ['type', 'amount'] },
+      { 
+        model: Transaction, 
+        as: 'transactions', 
+        attributes: ['id', 'amount', 'description'],
+        include: [{ model: Category, as: 'category', attributes: ['type'] }]
+      },
     ],
     order: [['created_at', 'DESC']],
   });
 
   const enriched = rows.map((loan) => {
-    const txns       = loan.loanTransactions || [];
-    const disbursed  = txns.filter((t) => t.type === 'DISBURSEMENT').reduce((s, t) => s + parseFloat(t.amount), 0);
-    const repaid     = txns.filter((t) => t.type === 'REPAYMENT').reduce((s, t) => s + parseFloat(t.amount), 0);
-    const principal  = parseFloat(loan.principal_amount);
+    const txns = loan.transactions || [];
+    let disbursed = 0;
+    let repaid = 0;
 
+    txns.forEach((t) => {
+      const amt = parseFloat(t.amount || 0);
+      if (isRepayment(t, loan.loan_type)) {
+        repaid += amt;
+      } else {
+        disbursed += amt;
+      }
+    });
+
+    const principal = parseFloat(loan.principal_amount);
+    const baseDebt = (loan.loan_type === 'TAKEN' && disbursed === 0) ? principal : (disbursed || principal);
     const balance = loan.loan_type === 'GIVEN'
       ? principal - repaid
-      : disbursed - repaid;
+      : baseDebt - repaid;
 
     return { ...loan.toJSON(), balance_pending: parseFloat(balance.toFixed(2)) };
   });
@@ -73,7 +93,16 @@ const getById = async (id) => {
 const create = async (data, createdBy) => {
   const vendor = await Vendor.findByPk(data.vendor_id);
   if (!vendor) throw new NotFoundError('Vendor not found');
-  return Loan.create({ ...data, created_by: createdBy ?? null });
+  return Loan.create({
+    vendor_id: data.vendor_id,
+    loan_type: data.loan_type,
+    principal_amount: data.principal_amount,
+    interest_percent: data.interest_percent,
+    start_date: data.start_date,
+    end_date: data.end_date,
+    notes: data.notes || data.remarks || null,
+    created_by: createdBy ?? null,
+  });
 };
 
 const update = async (id, data) => {
@@ -98,26 +127,37 @@ const getLedger = async (id) => {
     include: [
       ...INCLUDE_VENDOR,
       {
-        model:   LoanTransaction,
-        as:      'loanTransactions',
-        order:   [['transaction_date', 'ASC']],
+        model: Transaction,
+        as: 'transactions',
+        include: [{ model: Category, as: 'category', attributes: ['type', 'name'] }],
       },
     ],
-    order: [[{ model: LoanTransaction, as: 'loanTransactions' }, 'transaction_date', 'ASC']],
+    order: [[{ model: Transaction, as: 'transactions' }, 'transaction_date', 'ASC']],
   });
 
   if (!loan) throw new NotFoundError('Loan not found');
 
-  let balance = loan.loan_type === 'GIVEN' ? parseFloat(loan.principal_amount) : 0;
+  const hasDisbursements = (loan.transactions || []).some((t) => !isRepayment(t, loan.loan_type));
+  let balance = loan.loan_type === 'GIVEN' || !hasDisbursements
+    ? parseFloat(loan.principal_amount)
+    : 0;
 
-  const statement = (loan.loanTransactions || []).map((lt) => {
-    const amt = parseFloat(lt.amount);
-    if (loan.loan_type === 'GIVEN') {
-      balance -= lt.type === 'REPAYMENT' ? amt : -amt;
-    } else {
-      balance += lt.type === 'DISBURSEMENT' ? amt : -amt;
-    }
-    return { ...lt.toJSON(), running_balance: parseFloat(balance.toFixed(2)) };
+  const statement = (loan.transactions || []).map((t) => {
+    const amt = parseFloat(t.amount);
+    const repayment = isRepayment(t, loan.loan_type);
+    const type = repayment ? 'REPAYMENT' : 'DISBURSEMENT';
+
+    balance -= repayment ? amt : -amt;
+
+    return {
+      id: t.id,
+      transaction_date: t.transaction_date,
+      type,
+      amount: amt,
+      payment_mode: t.payment_mode,
+      remarks: t.description,
+      running_balance: parseFloat(balance.toFixed(2)),
+    };
   });
 
   const totalDisbursed = statement
@@ -128,7 +168,7 @@ const getLedger = async (id) => {
     .reduce((a, s) => a + parseFloat(s.amount), 0);
 
   return {
-    loan:           loan.toJSON(),
+    loan:            loan.toJSON(),
     total_disbursed: parseFloat(totalDisbursed.toFixed(2)),
     total_repaid:    parseFloat(totalRepaid.toFixed(2)),
     balance_pending: parseFloat(balance.toFixed(2)),

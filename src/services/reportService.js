@@ -1,82 +1,127 @@
-const { FuelSale, FuelType, Transaction, Category, Vendor, Loan, LoanTransaction } = require('../models');
-const { Op, fn, col, literal } = require('sequelize');
+const { Transaction, Category, Vendor, Loan, DailyDaybook } = require('../models');
+const { Op, fn, col } = require('sequelize');
 const sequelize = require('../config/database');
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
-const dateRange = (from, to) => ({
-  [Op.gte]: from,
-  [Op.lte]: to,
-});
+const dateRange = (from, to) => {
+  const r = {};
+  if (from) r[Op.gte] = from;
+  if (to)   r[Op.lte] = to;
+  return Object.keys(r).length > 0 ? r : { [Op.ne]: null };
+};
 
-// ── Fuel Reports ─────────────────────────────────────────────────────────────
+const isRepayment = (t, loanType) => {
+  if (t.description && t.description.includes('[REPAYMENT]')) return true;
+  if (t.description && t.description.includes('[DISBURSEMENT]')) return false;
+  return loanType === 'GIVEN';
+};
 
-const getFuelDaily = async ({ from_date, to_date, fuel_type_id }) => {
-  const where = { sale_date: dateRange(from_date, to_date) };
-  if (fuel_type_id) where.fuel_type_id = fuel_type_id;
+// ── Fuel Reports (Driven purely by DailyDaybook) ──────────────────────────────
 
-  return FuelSale.findAll({
-    where,
-    attributes: [
-      'sale_date',
-      [fn('SUM', col('litres_sold')),       'total_litres'],
-      [fn('SUM', col('sales_amount')),       'total_sales'],
-      [fn('SUM', col('commission_amount')), 'total_commission'],
-    ],
-    include: [{ model: FuelType, as: 'fuelType', attributes: ['id', 'fuel_type', 'code'] }],
-    group:   ['sale_date', 'fuelType.id'],
-    order:   [['sale_date', 'DESC']],
-    raw:     false,
+const getFuelDaily = async ({ from_date, to_date }) => {
+  const rows = await DailyDaybook.findAll({
+    where: { entry_date: dateRange(from_date, to_date) },
+    order: [['entry_date', 'DESC']],
+    raw: true,
+  });
+
+  return rows.map((r) => {
+    const msLitres = parseFloat(r.ms_sold || 0);
+    const hsdLitres = parseFloat(r.hsd_sold || 0);
+    const msAmt = parseFloat(r.ms_amount || 0);
+    const hsdAmt = parseFloat(r.hsd_amount || 0);
+    const msMargin = parseFloat(r.ms_margin || 3.50);
+    const hsdMargin = parseFloat(r.hsd_margin || 3.00);
+    const comm = parseFloat(r.total_margin || 0) || parseFloat(((msLitres * msMargin) + (hsdLitres * hsdMargin)).toFixed(2));
+
+    return {
+      sale_date: r.entry_date,
+      total_litres: msLitres + hsdLitres,
+      total_sales: msAmt + hsdAmt,
+      total_commission: comm,
+      ms_litres: msLitres,
+      ms_amount: msAmt,
+      hsd_litres: hsdLitres,
+      hsd_amount: hsdAmt,
+    };
   });
 };
 
 const getFuelMonthly = async ({ from_date, to_date }) => {
-  const rows = await sequelize.query(
-    `SELECT
-       DATE_FORMAT(sale_date, '%Y-%m') AS month,
-       SUM(litres_sold)       AS total_litres,
-       SUM(sales_amount)      AS total_sales,
-       SUM(commission_amount) AS total_commission
-     FROM fuel_sales
-     WHERE sale_date BETWEEN :from_date AND :to_date
-     GROUP BY month
-     ORDER BY month DESC`,
-    { replacements: { from_date, to_date }, type: sequelize.QueryTypes.SELECT }
-  );
-  return rows;
+  const rows = await DailyDaybook.findAll({
+    where: { entry_date: dateRange(from_date, to_date) },
+    order: [['entry_date', 'DESC']],
+    raw: true,
+  });
+
+  const monthMap = {};
+  rows.forEach((r) => {
+    const month = String(r.entry_date).substring(0, 7);
+    if (!monthMap[month]) {
+      monthMap[month] = { month, total_litres: 0, total_sales: 0, total_commission: 0 };
+    }
+    const litres = parseFloat(r.ms_sold || 0) + parseFloat(r.hsd_sold || 0);
+    const sales = parseFloat(r.total_sales || 0);
+    const msMargin = parseFloat(r.ms_margin || 3.50);
+    const hsdMargin = parseFloat(r.hsd_margin || 3.00);
+    const comm = parseFloat(r.total_margin || 0) || ((parseFloat(r.ms_sold || 0) * msMargin) + (parseFloat(r.hsd_sold || 0) * hsdMargin));
+
+    monthMap[month].total_litres += litres;
+    monthMap[month].total_sales += sales;
+    monthMap[month].total_commission += comm;
+  });
+
+  return Object.values(monthMap).sort((a, b) => b.month.localeCompare(a.month));
 };
 
 const getFuelByType = async ({ from_date, to_date }) => {
-  return FuelSale.findAll({
-    where:      { sale_date: dateRange(from_date, to_date) },
-    attributes: [
-      [fn('SUM', col('litres_sold')),       'total_litres'],
-      [fn('SUM', col('sales_amount')),       'total_sales'],
-      [fn('SUM', col('commission_amount')), 'total_commission'],
-    ],
-    include: [{ model: FuelType, as: 'fuelType', attributes: ['id', 'fuel_type', 'code'] }],
-    group:   ['fuel_type_id', 'fuelType.id'],
-    order:   [[fn('SUM', col('sales_amount')), 'DESC']],
+  const rows = await DailyDaybook.findAll({
+    where: { entry_date: dateRange(from_date, to_date) },
+    raw: true,
   });
+
+  let msLitres = 0, msSales = 0;
+  let hsdLitres = 0, hsdSales = 0;
+
+  let msCommission = 0, hsdCommission = 0;
+
+  rows.forEach((r) => {
+    const msL = parseFloat(r.ms_sold || 0);
+    const msMgn = parseFloat(r.ms_margin || 3.50);
+    const hsdL = parseFloat(r.hsd_sold || 0);
+    const hsdMgn = parseFloat(r.hsd_margin || 3.00);
+
+    msLitres += msL;
+    msSales += parseFloat(r.ms_amount || 0);
+    msCommission += parseFloat((msL * msMgn).toFixed(2));
+
+    hsdLitres += hsdL;
+    hsdSales += parseFloat(r.hsd_amount || 0);
+    hsdCommission += parseFloat((hsdL * hsdMgn).toFixed(2));
+  });
+
+  return [
+    {
+      fuel_type: 'Petrol',
+      code: 'MS',
+      total_litres: parseFloat(msLitres.toFixed(2)),
+      total_sales: parseFloat(msSales.toFixed(2)),
+      total_commission: parseFloat(msCommission.toFixed(2)),
+    },
+    {
+      fuel_type: 'Diesel',
+      code: 'HSD',
+      total_litres: parseFloat(hsdLitres.toFixed(2)),
+      total_sales: parseFloat(hsdSales.toFixed(2)),
+      total_commission: parseFloat(hsdCommission.toFixed(2)),
+    },
+  ];
 };
 
-const getFuelCommission = async ({ from_date, to_date, fuel_type_id }) => {
-  const where = { sale_date: dateRange(from_date, to_date) };
-  if (fuel_type_id) where.fuel_type_id = fuel_type_id;
-
-  const rows = await FuelSale.findAll({
-    where,
-    attributes: [
-      'sale_date',
-      [fn('SUM', col('litres_sold')),       'total_litres'],
-      [fn('SUM', col('commission_amount')), 'total_commission'],
-    ],
-    include: [{ model: FuelType, as: 'fuelType', attributes: ['id', 'fuel_type', 'code'] }],
-    group:   ['sale_date', 'fuelType.id'],
-    order:   [['sale_date', 'DESC']],
-  });
-
-  const grand_total = rows.reduce((s, r) => s + parseFloat(r.get('total_commission') || 0), 0);
+const getFuelCommission = async ({ from_date, to_date }) => {
+  const rows = await getFuelDaily({ from_date, to_date });
+  const grand_total = rows.reduce((s, r) => s + parseFloat(r.total_commission || 0), 0);
   return { rows, grand_total: parseFloat(grand_total.toFixed(2)) };
 };
 
@@ -102,21 +147,41 @@ const getIncomeExpense = async ({ from_date, to_date, type }) => {
 };
 
 const getProfit = async ({ from_date, to_date }) => {
-  const rows = await sequelize.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN c.type = 'INCOME'  THEN t.amount ELSE 0 END), 0) AS total_income,
-       COALESCE(SUM(CASE WHEN c.type = 'EXPENSE' THEN t.amount ELSE 0 END), 0) AS total_expense
-     FROM transactions t
-     JOIN categories c ON c.id = t.category_id
-     WHERE t.transaction_date BETWEEN :from_date AND :to_date`,
-    { replacements: { from_date, to_date }, type: sequelize.QueryTypes.SELECT }
-  );
+  const [daybookRows, txnSummary] = await Promise.all([
+    DailyDaybook.findAll({
+      where: { entry_date: dateRange(from_date, to_date) },
+      attributes: ['ms_sold', 'hsd_sold', 'day_expenses', 'total_margin', 'ms_margin', 'hsd_margin'],
+      raw: true,
+    }),
+    sequelize.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN c.type = 'INCOME'  THEN t.amount ELSE 0 END), 0) AS total_income,
+         COALESCE(SUM(CASE WHEN c.type = 'EXPENSE' THEN t.amount ELSE 0 END), 0) AS total_expense
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       WHERE t.transaction_date BETWEEN :from_date AND :to_date`,
+      { replacements: { from_date, to_date }, type: sequelize.QueryTypes.SELECT }
+    ),
+  ]);
 
-  const { total_income, total_expense } = rows[0];
+  let fuel_commission = 0;
+  daybookRows.forEach((r) => {
+    fuel_commission += parseFloat(r.total_margin || 0) || 
+      ((parseFloat(r.ms_sold || 0) * parseFloat(r.ms_margin || 3.50)) + 
+       (parseFloat(r.hsd_sold || 0) * parseFloat(r.hsd_margin || 3.00)));
+  });
+
+  const total_income  = parseFloat(txnSummary[0]?.total_income || 0);
+  const total_expense = parseFloat(txnSummary[0]?.total_expense || 0);
+  const net_profit    = fuel_commission + total_income - total_expense;
+
   return {
-    total_income:  parseFloat(total_income),
-    total_expense: parseFloat(total_expense),
-    net_profit:    parseFloat(total_income) - parseFloat(total_expense),
+    from_date,
+    to_date,
+    fuel_commission: parseFloat(fuel_commission.toFixed(2)),
+    other_income:    parseFloat(total_income.toFixed(2)),
+    expenses:        parseFloat(total_expense.toFixed(2)),
+    net_profit:      parseFloat(net_profit.toFixed(2)),
   };
 };
 
@@ -130,39 +195,64 @@ const getPaymentMode = async ({ from_date, to_date }) => {
   });
 };
 
-// ── Loan Reports ──────────────────────────────────────────────────────────────
+// ── Loan Reports ─────────────────────────────────────────────────────────────
 
-const getLoansActive = async ({ loan_type } = {}) => {
-  const where = { status: 'ACTIVE' };
-  if (loan_type) where.loan_type = loan_type;
-
-  return Loan.findAll({
-    where,
+const getLoansActive = async () => {
+  const loans = await Loan.findAll({
+    where:   { status: 'ACTIVE' },
     include: [
       { model: Vendor, as: 'vendor', attributes: ['id', 'name', 'phone'] },
-      { model: LoanTransaction, as: 'loanTransactions', attributes: ['type', 'amount'] },
+      { model: Transaction, as: 'transactions', attributes: ['amount', 'description'] },
     ],
-    order: [['created_at', 'DESC']],
+    order: [['start_date', 'ASC']],
+  });
+
+  return loans.map((loan) => {
+    const txns = loan.transactions || [];
+    let disbursed = 0;
+    let repaid = 0;
+    txns.forEach((t) => {
+      const amt = parseFloat(t.amount || 0);
+      if (isRepayment(t, loan.loan_type)) repaid += amt;
+      else disbursed += amt;
+    });
+
+    const principal = parseFloat(loan.principal_amount || 0);
+    const baseDebt = (loan.loan_type === 'TAKEN' && disbursed === 0) ? principal : (disbursed || principal);
+    const balance = loan.loan_type === 'GIVEN'
+      ? principal - repaid
+      : baseDebt - repaid;
+
+    return {
+      ...loan.toJSON(),
+      total_disbursed: parseFloat(disbursed.toFixed(2)),
+      total_repaid:    parseFloat(repaid.toFixed(2)),
+      balance_pending: parseFloat(balance.toFixed(2)),
+    };
   });
 };
 
-const getLoansClosed = async ({ loan_type } = {}) => {
+const getLoansClosed = async ({ from_date, to_date }) => {
   const where = { status: 'CLOSED' };
-  if (loan_type) where.loan_type = loan_type;
+  if (from_date || to_date) {
+    where.updated_at = {};
+    if (from_date) where.updated_at[Op.gte] = from_date;
+    if (to_date)   where.updated_at[Op.lte] = to_date;
+  }
 
   return Loan.findAll({
     where,
     include: [{ model: Vendor, as: 'vendor', attributes: ['id', 'name', 'phone'] }],
-    order:   [['created_at', 'DESC']],
+    order:   [['updated_at', 'DESC']],
   });
 };
 
 const getLoansInterest = async () => {
   const loans = await Loan.findAll({
-    where:   { status: 'ACTIVE', interest_percent: { [Op.gt]: 0 } },
+    where:   { status: 'ACTIVE' },
     include: [
       { model: Vendor, as: 'vendor', attributes: ['id', 'name'] },
-      { model: LoanTransaction, as: 'loanTransactions', attributes: ['type', 'amount', 'transaction_date'] },
+      { model: Transaction, as: 'transactions', attributes: ['amount', 'description'] },
     ],
   });
 
@@ -173,9 +263,10 @@ const getLoansInterest = async () => {
     const today       = new Date();
     const daysElapsed = Math.max(0, Math.floor((today - start) / (1000 * 60 * 60 * 24)));
 
-    const repaid       = (loan.loanTransactions || [])
-      .filter((t) => t.type === 'REPAYMENT')
-      .reduce((s, t) => s + parseFloat(t.amount), 0);
+    let repaid = 0;
+    (loan.transactions || []).forEach((t) => {
+      if (isRepayment(t, loan.loan_type)) repaid += parseFloat(t.amount || 0);
+    });
 
     const outstanding      = Math.max(0, principal - repaid);
     const interestAccrued  = parseFloat((outstanding * rate * (daysElapsed / 365)).toFixed(2));
@@ -210,7 +301,7 @@ const getVendorLedger = async (vendorId, { from_date, to_date }) => {
     }),
     Loan.findAll({
       where:   { vendor_id: vendorId },
-      include: [{ model: LoanTransaction, as: 'loanTransactions' }],
+      include: [{ model: Transaction, as: 'transactions' }],
       order:   [['start_date', 'DESC']],
     }),
   ]);
@@ -236,42 +327,124 @@ const getCategoryWise = async ({ from_date, to_date, type }) => {
   });
 };
 
-const getMonthlyReport = async ({ from_date, to_date }) => {
-  // 1. Get Fuel Summary
-  const fuelSummary = await FuelSale.findOne({
-    where: { sale_date: dateRange(from_date, to_date) },
-    attributes: [
-      [fn('COALESCE', fn('SUM', col('litres_sold')), 0), 'total_litres'],
-      [fn('COALESCE', fn('SUM', col('sales_amount')), 0), 'total_amount'],
-      [fn('COALESCE', fn('SUM', col('commission_amount')), 0), 'total_commission'],
-    ],
-    raw: true,
-  });
+const getMonthlyReport = async ({ from_date, to_date, month }) => {
+  let start = from_date;
+  let end = to_date;
+  if (!start && month) {
+    start = `${month}-01`;
+    const [y, m] = month.split('-').map(Number);
+    const lastDay = new Date(y, m, 0).getDate();
+    end = `${month}-${String(lastDay).padStart(2, '0')}`;
+  }
+  if (!start) start = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0];
+  if (!end) end = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).toISOString().split('T')[0];
 
-  // 2. Get Transaction Summary
-  const txnSummary = await sequelize.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN c.type = 'INCOME'  THEN t.amount ELSE 0 END), 0) AS total_income,
-       COALESCE(SUM(CASE WHEN c.type = 'EXPENSE' THEN t.amount ELSE 0 END), 0) AS total_expense
-     FROM transactions t
-     JOIN categories c ON c.id = t.category_id
-     WHERE t.transaction_date BETWEEN :from_date AND :to_date`,
-    { replacements: { from_date, to_date }, type: sequelize.QueryTypes.SELECT }
-  );
+  const [daybookSummary, txnSummary, categoryBreakdown] = await Promise.all([
+    DailyDaybook.findAll({
+      where: { entry_date: dateRange(start, end) },
+      order: [['entry_date', 'DESC']],
+      raw: true,
+    }),
+    sequelize.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN c.type = 'INCOME'  THEN t.amount ELSE 0 END), 0) AS total_income,
+         COALESCE(SUM(CASE WHEN c.type = 'EXPENSE' THEN t.amount ELSE 0 END), 0) AS total_expense
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       WHERE t.transaction_date BETWEEN :start AND :end`,
+      { replacements: { start, end }, type: sequelize.QueryTypes.SELECT }
+    ),
+    sequelize.query(
+      `SELECT
+         c.name AS category_name,
+         c.type AS category_type,
+         COALESCE(SUM(t.amount), 0) AS total_amount
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       WHERE t.transaction_date BETWEEN :start AND :end
+       GROUP BY c.id, c.name, c.type
+       ORDER BY total_amount DESC`,
+      { replacements: { start, end }, type: sequelize.QueryTypes.SELECT }
+    ),
+  ]);
 
-  const total_income = parseFloat(txnSummary[0]?.total_income || 0);
-  const total_expense = parseFloat(txnSummary[0]?.total_expense || 0);
+  let total_litres = 0;
+  let total_amount = 0;
+  let total_commission = 0;
 
-  // 3. Get Daily Breakdown
-  const fuelDays = await FuelSale.findAll({
-    where: { sale_date: dateRange(from_date, to_date) },
-    attributes: [
-      'sale_date',
-      [fn('SUM', col('litres_sold')), 'litres'],
-      [fn('SUM', col('sales_amount')), 'fuel_amount'],
-    ],
-    group: ['sale_date'],
-    raw: true,
+  let ms_litres = 0, ms_amount = 0, ms_commission = 0;
+  let hsd_litres = 0, hsd_amount = 0, hsd_commission = 0;
+
+  let cash_collected = 0;
+  let upi_collected = 0;
+  let card_collected = 0;
+  let credit_collected = 0;
+  let total_collected = 0;
+  let short_excess = 0;
+
+  const breakdownMap = {};
+
+  daybookSummary.forEach((d) => {
+    const msL = parseFloat(d.ms_sold || 0);
+    const hsdL = parseFloat(d.hsd_sold || 0);
+    const msAmt = parseFloat(d.ms_amount || 0);
+    const hsdAmt = parseFloat(d.hsd_amount || 0);
+    const msMgn = parseFloat(d.ms_margin || 3.50);
+    const hsdMgn = parseFloat(d.hsd_margin || 3.00);
+    const msComm = parseFloat((msL * msMgn).toFixed(2));
+    const hsdComm = parseFloat((hsdL * hsdMgn).toFixed(2));
+    const dayComm = parseFloat(d.total_margin || 0) || (msComm + hsdComm);
+
+    const dayLitres = msL + hsdL;
+    const dayAmount = parseFloat(d.total_sales || 0);
+
+    const cCash = parseFloat(d.cash_collected || 0);
+    const cUpi = parseFloat(d.upi_collected || 0);
+    const cCard = parseFloat(d.card_collected || 0);
+    const cCredit = parseFloat(d.credit_collected || 0);
+    const cTotal = parseFloat(d.total_collected || 0) || (cCash + cUpi + cCard + cCredit);
+    const cShort = parseFloat(d.short_excess || 0);
+
+    total_litres += dayLitres;
+    total_amount += dayAmount;
+    total_commission += dayComm;
+
+    ms_litres += msL;
+    ms_amount += msAmt;
+    ms_commission += msComm;
+
+    hsd_litres += hsdL;
+    hsd_amount += hsdAmt;
+    hsd_commission += hsdComm;
+
+    cash_collected += cCash;
+    upi_collected += cUpi;
+    card_collected += cCard;
+    credit_collected += cCredit;
+    total_collected += cTotal;
+    short_excess += cShort;
+
+    const dateStr = d.entry_date;
+    breakdownMap[dateStr] = {
+      date: dateStr,
+      litres: dayLitres,
+      ms_litres: msL,
+      ms_amount: msAmt,
+      hsd_litres: hsdL,
+      hsd_amount: hsdAmt,
+      fuel_amount: dayAmount,
+      commission: dayComm,
+      cash_collected: cCash,
+      upi_collected: cUpi,
+      card_collected: cCard,
+      credit_collected: cCredit,
+      total_collected: cTotal,
+      short_excess: cShort,
+      income: 0,
+      expense: 0,
+      net: 0,
+      net_profit: dayComm,
+    };
   });
 
   const txnDays = await sequelize.query(
@@ -281,23 +454,10 @@ const getMonthlyReport = async ({ from_date, to_date }) => {
        SUM(CASE WHEN c.type = 'EXPENSE' THEN t.amount ELSE 0 END) AS expense
      FROM transactions t
      JOIN categories c ON c.id = t.category_id
-     WHERE t.transaction_date BETWEEN :from_date AND :to_date
+     WHERE t.transaction_date BETWEEN :start AND :end
      GROUP BY t.transaction_date`,
-    { replacements: { from_date, to_date }, type: sequelize.QueryTypes.SELECT }
+    { replacements: { start, end }, type: sequelize.QueryTypes.SELECT }
   );
-
-  const breakdownMap = {};
-
-  fuelDays.forEach((f) => {
-    breakdownMap[f.sale_date] = {
-      date: f.sale_date,
-      litres: parseFloat(f.litres || 0),
-      fuel_amount: parseFloat(f.fuel_amount || 0),
-      income: 0,
-      expense: 0,
-      net: 0,
-    };
-  });
 
   txnDays.forEach((t) => {
     const dateStr = t.sale_date;
@@ -305,26 +465,125 @@ const getMonthlyReport = async ({ from_date, to_date }) => {
       breakdownMap[dateStr] = {
         date: dateStr,
         litres: 0,
+        ms_litres: 0,
+        ms_amount: 0,
+        hsd_litres: 0,
+        hsd_amount: 0,
         fuel_amount: 0,
+        commission: 0,
+        cash_collected: 0,
+        upi_collected: 0,
+        card_collected: 0,
+        credit_collected: 0,
+        total_collected: 0,
+        short_excess: 0,
         income: 0,
         expense: 0,
         net: 0,
+        net_profit: 0,
       };
     }
-    breakdownMap[dateStr].income = parseFloat(t.income || 0);
-    breakdownMap[dateStr].expense = parseFloat(t.expense || 0);
+    const dayInc = parseFloat(t.income || 0);
+    const dayExp = parseFloat(t.expense || 0);
+    breakdownMap[dateStr].income += dayInc;
+    breakdownMap[dateStr].expense += dayExp;
   });
 
   const dailyBreakdown = Object.values(breakdownMap).map((day) => {
     day.net = day.income - day.expense;
+    day.net_profit = parseFloat((day.commission + day.income - day.expense).toFixed(2));
     return day;
   }).sort((a, b) => b.date.localeCompare(a.date));
 
+  const total_income = parseFloat(txnSummary[0]?.total_income || 0);
+  const total_expense = parseFloat(txnSummary[0]?.total_expense || 0);
+  const net_profit = parseFloat((total_commission + total_income - total_expense).toFixed(2));
+
+  // Category breakdowns with percentages
+  const expenses_by_category = [];
+  const incomes_by_category = [];
+
+  categoryBreakdown.forEach((c) => {
+    const amt = parseFloat(c.total_amount || 0);
+    if (c.category_type === 'EXPENSE') {
+      const pct = total_expense > 0 ? parseFloat(((amt / total_expense) * 100).toFixed(1)) : 0;
+      expenses_by_category.push({ name: c.category_name, amount: amt, percent: pct });
+    } else if (c.category_type === 'INCOME') {
+      const pct = total_income > 0 ? parseFloat(((amt / total_income) * 100).toFixed(1)) : 0;
+      incomes_by_category.push({ name: c.category_name, amount: amt, percent: pct });
+    }
+  });
+
+  const totalCollClean = total_collected || total_amount;
+  const collections_breakdown = [
+    {
+      mode: 'CASH',
+      label: 'Cash in Hand',
+      amount: parseFloat(cash_collected.toFixed(2)),
+      percent: totalCollClean > 0 ? parseFloat(((cash_collected / totalCollClean) * 100).toFixed(1)) : 0,
+      icon: 'Cash',
+      color: 'emerald',
+    },
+    {
+      mode: 'UPI',
+      label: 'PhonePe / GPay / UPI',
+      amount: parseFloat(upi_collected.toFixed(2)),
+      percent: totalCollClean > 0 ? parseFloat(((upi_collected / totalCollClean) * 100).toFixed(1)) : 0,
+      icon: 'Smartphone',
+      color: 'blue',
+    },
+    {
+      mode: 'CARD',
+      label: 'Card / POS Swipes',
+      amount: parseFloat(card_collected.toFixed(2)),
+      percent: totalCollClean > 0 ? parseFloat(((card_collected / totalCollClean) * 100).toFixed(1)) : 0,
+      icon: 'CreditCard',
+      color: 'violet',
+    },
+    {
+      mode: 'CREDIT',
+      label: 'Company / Fleet Credit',
+      amount: parseFloat(credit_collected.toFixed(2)),
+      percent: totalCollClean > 0 ? parseFloat(((credit_collected / totalCollClean) * 100).toFixed(1)) : 0,
+      icon: 'Building2',
+      color: 'amber',
+    },
+  ];
+
   return {
     fuel: {
-      total_litres: parseFloat(fuelSummary?.total_litres || 0),
-      total_amount: parseFloat(fuelSummary?.total_amount || 0),
-      total_commission: parseFloat(fuelSummary?.total_commission || 0),
+      total_litres: parseFloat(total_litres.toFixed(2)),
+      total_amount: parseFloat(total_amount.toFixed(2)),
+      total_commission: parseFloat(total_commission.toFixed(2)),
+      ms: {
+        litres: parseFloat(ms_litres.toFixed(2)),
+        amount: parseFloat(ms_amount.toFixed(2)),
+        commission: parseFloat(ms_commission.toFixed(2)),
+      },
+      hsd: {
+        litres: parseFloat(hsd_litres.toFixed(2)),
+        amount: parseFloat(hsd_amount.toFixed(2)),
+        commission: parseFloat(hsd_commission.toFixed(2)),
+      },
+    },
+    collections: {
+      total_sales: parseFloat(total_amount.toFixed(2)),
+      total_collected: parseFloat(total_collected.toFixed(2)),
+      cash_collected: parseFloat(cash_collected.toFixed(2)),
+      upi_collected: parseFloat(upi_collected.toFixed(2)),
+      card_collected: parseFloat(card_collected.toFixed(2)),
+      credit_collected: parseFloat(credit_collected.toFixed(2)),
+      short_excess: parseFloat(short_excess.toFixed(2)),
+      breakdown: collections_breakdown,
+    },
+    financials: {
+      fuel_commission: parseFloat(total_commission.toFixed(2)),
+      total_income,
+      total_expense,
+      net_balance: total_income - total_expense,
+      net_profit,
+      expenses_by_category,
+      incomes_by_category,
     },
     transactions: {
       total_income,

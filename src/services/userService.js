@@ -1,14 +1,14 @@
 const { User } = require('../models');
 const { Op } = require('sequelize');
-const { NotFoundError, ConflictError } = require('../utils/AppError');
+const { NotFoundError, ConflictError, ValidationError } = require('../utils/AppError');
 const { getPagination, buildMeta, getSortOrder } = require('../utils/pagination');
 
 const SAFE_ATTRS = { exclude: ['password'] };
-const SORTABLE   = ['username', 'email', 'role', 'created_at'];
+const SORTABLE   = ['username', 'email', 'role', 'created_at', 'id'];
 
 const list = async (query) => {
   const { page, limit, offset } = getPagination(query);
-  const order = getSortOrder(query, SORTABLE, 'created_at');
+  const order = getSortOrder(query, SORTABLE, 'created_at', 'id');
 
   const where = {};
   if (query.role)      where.role      = query.role;
@@ -36,17 +36,38 @@ const create = async (data) => {
   const existing = await User.findOne({ where: { email: data.email } });
   if (existing) throw new ConflictError('A user with this email already exists');
 
-  return User.create(data);
+  const created = await User.create(data);
+  return User.findByPk(created.id, { attributes: SAFE_ATTRS });
 };
 
-const update = async (id, data) => {
+const update = async (id, data, requesterId) => {
   const user = await getById(id);
+
+  // Prevent self-deactivation or self-demotion
+  if (requesterId && parseInt(id, 10) === parseInt(requesterId, 10)) {
+    if (data.is_active === false || data.is_active === 0 || data.is_active === 'false') {
+      throw new ValidationError('You cannot deactivate your own account.');
+    }
+    if (user.role === 'ADMIN' && data.role && data.role !== 'ADMIN') {
+      throw new ValidationError('You cannot change your own role from Admin.');
+    }
+  }
+
+  if (data.email && data.email !== user.email) {
+    const existing = await User.findOne({ where: { email: data.email, id: { [Op.ne]: id } } });
+    if (existing) throw new ConflictError('A user with this email already exists');
+  }
   await user.update(data);
   return user.reload({ attributes: SAFE_ATTRS });
 };
 
-const toggleStatus = async (id) => {
+const toggleStatus = async (id, requesterId) => {
   const user = await getById(id);
+
+  if (requesterId && parseInt(id, 10) === parseInt(requesterId, 10) && user.is_active) {
+    throw new ValidationError('You cannot deactivate your own account.');
+  }
+
   await user.update({ is_active: !user.is_active });
   return getById(id);
 };
