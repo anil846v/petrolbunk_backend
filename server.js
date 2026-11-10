@@ -13,6 +13,7 @@ async function startServer() {
     // alter:false — only creates tables that don't exist, never modifies existing ones
     await sequelize.sync({ alter: false });
     console.log('✓ Database synchronized');
+    console.log('✓ Database Fully Running');
 
     app.listen(PORT, () => {
       console.log(` Server running on port ${PORT}`);
