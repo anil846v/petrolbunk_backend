@@ -93,6 +93,9 @@ app.use(
 // Prevent HTTP Parameter Pollution
 app.use(hpp());
 
+// Serve static uploaded files
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+
 
 /* =========================
    ROUTES

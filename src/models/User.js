@@ -43,6 +43,11 @@ const User = sequelize.define('User', {
     defaultValue: 'STAFF',
   },
 
+  profile_image: {
+    type: DataTypes.STRING(255),
+    allowNull: true,
+  },
+
 
   reset_token: {
     type: DataTypes.STRING(255),
