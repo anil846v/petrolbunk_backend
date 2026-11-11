@@ -56,11 +56,12 @@ const login = async (email, password) => {
   const token = generateToken(user.id);
 
   const profile = {
-    id:       user.id,
-    username: user.username,
-    email:    user.email,
-    role:     user.role,
-    phone_no: user.phone_no,
+    id:            user.id,
+    username:      user.username,
+    email:         user.email,
+    role:          user.role,
+    phone_no:      user.phone_no,
+    profile_image: user.profile_image,
   };
 
   return { token, profile };
