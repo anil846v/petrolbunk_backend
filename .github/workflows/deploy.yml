@@ -1,0 +1,39 @@
+name: Deploy Backend to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: SSH into EC2 and Deploy Backend
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script_stop: true
+          script: |
+            echo "==> Deploying petrolbunk-backend on AWS EC2..."
+            cd /var/www/petrolbunk/petrolbunk-backend
+            
+            echo "==> Pulling latest changes from main branch..."
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
+            
+            echo "==> Installing dependencies..."
+            npm install --production
+            
+            echo "==> Restarting PM2 process..."
+            pm2 restart petrolbunk-api
+            
+            echo "==> Checking API health..."
+            pm2 status
+            echo "==> Backend Deployment Complete!"
