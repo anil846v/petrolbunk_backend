@@ -11,7 +11,7 @@ async function startServer() {
     console.log('✓ Database connection successful');
 
     // alter:false — only creates tables that don't exist, never modifies existing ones
-    await sequelize.sync({ alter: false });
+    // await sequelize.sync({ alter: false });
     console.log('✓ Database synchronized');
     console.log('✓ Database Fully Running');
 
