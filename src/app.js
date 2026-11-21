@@ -11,6 +11,7 @@ const morgan     = require('morgan');
 const logger     = require('./utils/logger');
 const AppError   = require('./utils/AppError');
 const { apiLimiter } = require('./middleware/rateLimiter');
+const { redisClient } = require('./config/redis');
 
 const authRoutes            = require('./routes/authRoutes');
 const userRoutes            = require('./routes/userRoutes');
@@ -121,6 +122,7 @@ app.get('/api/health', (req, res) => {
     res.status(200).json({
         success: true,
         message: 'PetrolBunk API Running Successfully',
+        redis: redisClient ? redisClient.status : 'offline',
     });
 });
 
