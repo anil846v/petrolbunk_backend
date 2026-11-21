@@ -1,5 +1,6 @@
 const { DailyDaybook } = require('../models');
 const { Op } = require('sequelize');
+const { getOrSetCache } = require('../config/redis');
 
 /**
  * Fuel Rate Service:
@@ -146,50 +147,53 @@ const fetchLiveMarketRates = async (cityInput) => {
 const getLatestRates = async (options = {}) => {
   const allowLive = options.live !== false && process.env.AUTO_FETCH_RATES !== 'false';
   const targetCity = options.city || process.env.FUEL_CITY || 'chittoor';
+  const cacheKey = `petrolbunk:rates:${targetCity.toLowerCase()}`;
 
-  // 1. If live auto-fetch is allowed, attempt live fetch for target district
-  if (allowLive) {
-    const live = await fetchLiveMarketRates(targetCity);
-    if (live) {
+  return await getOrSetCache(cacheKey, 1800, async () => {
+    // 1. If live auto-fetch is allowed, attempt live fetch for target district
+    if (allowLive) {
+      const live = await fetchLiveMarketRates(targetCity);
+      if (live) {
+        return {
+          date: new Date().toISOString().split('T')[0],
+          ms_price: live.ms_price,
+          hsd_price: live.hsd_price,
+          city: live.city,
+          district: live.district,
+          source: live.source,
+          is_live: true,
+          is_default: false,
+        };
+      }
+    }
+
+    // 2. Check latest recorded daybook entry
+    const latest = await DailyDaybook.findOne({
+      attributes: ['entry_date', 'ms_price', 'hsd_price', 'updated_at'],
+      order: [['entry_date', 'DESC']],
+    });
+
+    if (latest) {
       return {
-        date: new Date().toISOString().split('T')[0],
-        ms_price: live.ms_price,
-        hsd_price: live.hsd_price,
-        city: live.city,
-        district: live.district,
-        source: live.source,
-        is_live: true,
+        date: latest.entry_date,
+        ms_price: parseFloat(latest.ms_price),
+        hsd_price: parseFloat(latest.hsd_price),
+        source: 'Previous Day Record',
+        is_live: false,
         is_default: false,
+        last_updated: latest.updated_at,
       };
     }
-  }
 
-  // 2. Check latest recorded daybook entry
-  const latest = await DailyDaybook.findOne({
-    attributes: ['entry_date', 'ms_price', 'hsd_price', 'updated_at'],
-    order: [['entry_date', 'DESC']],
-  });
-
-  if (latest) {
+    // 3. System defaults
     return {
-      date: latest.entry_date,
-      ms_price: parseFloat(latest.ms_price),
-      hsd_price: parseFloat(latest.hsd_price),
-      source: 'Previous Day Record',
+      date: new Date().toISOString().split('T')[0],
+      ...DEFAULT_RATES,
+      source: 'System Defaults',
       is_live: false,
-      is_default: false,
-      last_updated: latest.updated_at,
+      is_default: true,
     };
-  }
-
-  // 3. System defaults
-  return {
-    date: new Date().toISOString().split('T')[0],
-    ...DEFAULT_RATES,
-    source: 'System Defaults',
-    is_live: false,
-    is_default: true,
-  };
+  });
 };
 
 /**

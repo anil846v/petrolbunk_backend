@@ -4,6 +4,7 @@ const { NotFoundError, ValidationError } = require('../utils/AppError');
 const { getPagination, buildMeta, getSortOrder } = require('../utils/pagination');
 const { generateVoucherNo } = require('../utils/voucher');
 const sequelize = require('../config/database');
+const { getOrSetCache, delCache } = require('../config/redis');
 
 const SORTABLE = ['transaction_date', 'amount', 'created_at', 'id'];
 
@@ -57,100 +58,104 @@ const list = async (query) => {
  *   net              = total_commission + total_income - total_expense
  */
 const getSummary = async ({ from_date, to_date } = {}) => {
-  const dateWhere = {};
-  if (from_date && to_date) {
-    dateWhere.transaction_date = { [Op.gte]: from_date, [Op.lte]: to_date };
-  } else if (from_date) {
-    dateWhere.transaction_date = { [Op.gte]: from_date };
-  } else if (to_date) {
-    dateWhere.transaction_date = { [Op.lte]: to_date };
-  }
+  const cacheKey = `petrolbunk:summary:${from_date || 'all'}:${to_date || 'all'}`;
 
-  const daybookWhere = {};
-  if (from_date && to_date) {
-    daybookWhere.entry_date = { [Op.gte]: from_date, [Op.lte]: to_date };
-  } else if (from_date) {
-    daybookWhere.entry_date = { [Op.gte]: from_date };
-  } else if (to_date) {
-    daybookWhere.entry_date = { [Op.lte]: to_date };
-  }
-
-  const [byTypeAndRef, byMode, investRows, daybookRows] = await Promise.all([
-    // Group by category type + reference_type to split fuel commission from other income
-    Transaction.findAll({
-      where:      dateWhere,
-      include:    [{ model: Category, as: 'category', attributes: ['type'] }],
-      attributes: [
-        [fn('SUM', col('Transaction.amount')), 'total'],
-        [col('category.type'), 'category_type'],
-        'reference_type',
-      ],
-      group:    ['category.type', 'reference_type'],
-      raw:      true,
-      subQuery: false,
-    }),
-
-    // By payment mode
-    Transaction.findAll({
-      where:      dateWhere,
-      attributes: [[fn('SUM', col('amount')), 'total'], 'payment_mode'],
-      group:      ['payment_mode'],
-      raw:        true,
-    }),
-
-    // Invested amount = INCOME entries under category named 'Investment'
-    Transaction.findAll({
-      where:   dateWhere,
-      include: [{ model: Category, as: 'category', attributes: ['name', 'type'], where: { name: 'Investment', type: 'INCOME' } }],
-      attributes: [[fn('SUM', col('Transaction.amount')), 'total']],
-      raw:      true,
-      subQuery: false,
-    }),
-
-    // Fuel commission from DailyDaybook shifts
-    DailyDaybook.findAll({
-      where:      daybookWhere,
-      attributes: ['total_margin', 'ms_sold', 'ms_margin', 'hsd_sold', 'hsd_margin'],
-      raw:        true,
-    }),
-  ]);
-
-  let total_income = 0, total_commission = 0, total_expense = 0;
-
-  // Aggregate fuel commission from shifts
-  daybookRows.forEach((d) => {
-    const margin = parseFloat(d.total_margin || 0) ||
-      ((parseFloat(d.ms_sold || 0) * parseFloat(d.ms_margin || 3.50)) +
-       (parseFloat(d.hsd_sold || 0) * parseFloat(d.hsd_margin || 3.00)));
-    total_commission += margin;
-  });
-
-  byTypeAndRef.forEach((r) => {
-    const amt = parseFloat(r.total || 0);
-    if (r.category_type === 'EXPENSE') {
-      total_expense += amt;
-    } else if (r.category_type === 'INCOME') {
-      if (r.reference_type === 'FUEL') {
-        if (daybookRows.length === 0) total_commission += amt;
-      } else {
-        total_income += amt;
-      }
+  return await getOrSetCache(cacheKey, 300, async () => {
+    const dateWhere = {};
+    if (from_date && to_date) {
+      dateWhere.transaction_date = { [Op.gte]: from_date, [Op.lte]: to_date };
+    } else if (from_date) {
+      dateWhere.transaction_date = { [Op.gte]: from_date };
+    } else if (to_date) {
+      dateWhere.transaction_date = { [Op.lte]: to_date };
     }
+
+    const daybookWhere = {};
+    if (from_date && to_date) {
+      daybookWhere.entry_date = { [Op.gte]: from_date, [Op.lte]: to_date };
+    } else if (from_date) {
+      daybookWhere.entry_date = { [Op.gte]: from_date };
+    } else if (to_date) {
+      daybookWhere.entry_date = { [Op.lte]: to_date };
+    }
+
+    const [byTypeAndRef, byMode, investRows, daybookRows] = await Promise.all([
+      // Group by category type + reference_type to split fuel commission from other income
+      Transaction.findAll({
+        where:      dateWhere,
+        include:    [{ model: Category, as: 'category', attributes: ['type'] }],
+        attributes: [
+          [fn('SUM', col('Transaction.amount')), 'total'],
+          [col('category.type'), 'category_type'],
+          'reference_type',
+        ],
+        group:    ['category.type', 'reference_type'],
+        raw:      true,
+        subQuery: false,
+      }),
+
+      // By payment mode
+      Transaction.findAll({
+        where:      dateWhere,
+        attributes: [[fn('SUM', col('amount')), 'total'], 'payment_mode'],
+        group:      ['payment_mode'],
+        raw:        true,
+      }),
+
+      // Invested amount = INCOME entries under category named 'Investment'
+      Transaction.findAll({
+        where:   dateWhere,
+        include: [{ model: Category, as: 'category', attributes: ['name', 'type'], where: { name: 'Investment', type: 'INCOME' } }],
+        attributes: [[fn('SUM', col('Transaction.amount')), 'total']],
+        raw:      true,
+        subQuery: false,
+      }),
+
+      // Fuel commission from DailyDaybook shifts
+      DailyDaybook.findAll({
+        where:      daybookWhere,
+        attributes: ['total_margin', 'ms_sold', 'ms_margin', 'hsd_sold', 'hsd_margin'],
+        raw:        true,
+      }),
+    ]);
+
+    let total_income = 0, total_commission = 0, total_expense = 0;
+
+    // Aggregate fuel commission from shifts
+    daybookRows.forEach((d) => {
+      const margin = parseFloat(d.total_margin || 0) ||
+        ((parseFloat(d.ms_sold || 0) * parseFloat(d.ms_margin || 3.50)) +
+         (parseFloat(d.hsd_sold || 0) * parseFloat(d.hsd_margin || 3.00)));
+      total_commission += margin;
+    });
+
+    byTypeAndRef.forEach((r) => {
+      const amt = parseFloat(r.total || 0);
+      if (r.category_type === 'EXPENSE') {
+        total_expense += amt;
+      } else if (r.category_type === 'INCOME') {
+        if (r.reference_type === 'FUEL') {
+          if (daybookRows.length === 0) total_commission += amt;
+        } else {
+          total_income += amt;
+        }
+      }
+    });
+
+    const invested_amount = parseFloat(investRows[0]?.total || 0);
+
+    return {
+      total_income:     parseFloat(total_income.toFixed(2)),
+      invested_amount:  parseFloat(invested_amount.toFixed(2)),
+      total_commission: parseFloat(total_commission.toFixed(2)),
+      total_expense:    parseFloat(total_expense.toFixed(2)),
+      net:              parseFloat((total_commission + total_income - total_expense).toFixed(2)),
+      by_payment_mode:  byMode.map((r) => ({
+        payment_mode: r.payment_mode,
+        total:        parseFloat(r.total),
+      })),
+    };
   });
-
-  const invested_amount = parseFloat(investRows[0]?.total || 0);
-
-  return {
-    total_income:     parseFloat(total_income.toFixed(2)),
-    invested_amount:  parseFloat(invested_amount.toFixed(2)),
-    total_commission: parseFloat(total_commission.toFixed(2)),
-    total_expense:    parseFloat(total_expense.toFixed(2)),
-    net:              parseFloat((total_commission + total_income - total_expense).toFixed(2)),
-    by_payment_mode:  byMode.map((r) => ({
-      payment_mode: r.payment_mode,
-      total:        parseFloat(r.total),
-    })),
-  };
 };
 
 const getById = async (id, t = null) => {
@@ -181,7 +186,10 @@ const create = async (data, createdBy, externalTransaction = null) => {
       { transaction: t }
     );
     await txn.update({ voucher_no: generateVoucherNo(txn.id) }, { transaction: t });
-    if (managed) await t.commit();
+    if (managed) {
+      await t.commit();
+      delCache('petrolbunk:summary:*').catch(() => {});
+    }
     // Pass `t` so the row is visible even before the external caller commits
     return getById(txn.id, managed ? null : t);
   } catch (err) {
@@ -198,6 +206,7 @@ const update = async (id, data, updatedBy) => {
     );
   }
   await txn.update({ ...data, updated_by: updatedBy ?? null });
+  delCache('petrolbunk:summary:*').catch(() => {});
   return getById(id);
 };
 
@@ -209,6 +218,7 @@ const remove = async (id) => {
     );
   }
   await txn.destroy();
+  delCache('petrolbunk:summary:*').catch(() => {});
 };
 
 module.exports = { list, getSummary, getById, create, update, remove };

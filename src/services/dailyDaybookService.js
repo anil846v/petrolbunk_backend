@@ -2,6 +2,7 @@ const { sequelize, DailyDaybook, Transaction, Category, Vendor } = require('../m
 const { Op } = require('sequelize');
 const { ValidationError, NotFoundError } = require('../utils/AppError');
 const fuelRateService = require('./fuelRateService');
+const { delCache } = require('../config/redis');
 
 const N = (val) => {
   const parsed = parseFloat(val);
@@ -259,6 +260,10 @@ const saveDay = async (data, userId) => {
     }
   });
 
+  // Bust summary cache and daily daybook cache on shift update
+  delCache('petrolbunk:summary:*').catch(() => {});
+  delCache(`petrolbunk:daybook:${date}`).catch(() => {});
+
   return getByDate(date);
 };
 
@@ -352,6 +357,10 @@ const deleteDay = async (date) => {
 
     await row.destroy({ transaction: t });
   });
+
+  // Bust summary and shift cache on deletion
+  delCache('petrolbunk:summary:*').catch(() => {});
+  delCache(`petrolbunk:daybook:${date}`).catch(() => {});
 
   return { message: `Day Book for ${date} and synced shift vouchers deleted successfully` };
 };
