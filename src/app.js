@@ -26,6 +26,9 @@ const dailyDaybookRoutes    = require('./routes/dailyDaybookRoutes');
 
 const app = express();
 
+// Trust first-hop reverse proxy (Nginx) so express-rate-limit accurately identifies client IPs
+app.set('trust proxy', 1);
+
 /* =========================
    GLOBAL MIDDLEWARE
 ========================= */
