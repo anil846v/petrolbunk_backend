@@ -1,4 +1,4 @@
-const { DailyDaybook, Transaction, Category, Vendor } = require('../models');
+const { sequelize, DailyDaybook, Transaction, Category, Vendor } = require('../models');
 const { Op } = require('sequelize');
 const { ValidationError, NotFoundError } = require('../utils/AppError');
 const fuelRateService = require('./fuelRateService');
@@ -186,72 +186,78 @@ const saveDay = async (data, userId) => {
     updated_by: userId || null,
   };
 
-  const [record, created] = await DailyDaybook.findOrCreate({
-    where: { entry_date: date },
-    defaults: { ...payload, created_by: userId || null },
-  });
+  // Wrap entire DB save, voucher purge, and voucher re-insertion in an ACID transaction
+  await sequelize.transaction(async (t) => {
+    const [record, created] = await DailyDaybook.findOrCreate({
+      where: { entry_date: date },
+      defaults: { ...payload, created_by: userId || null },
+      transaction: t,
+    });
 
-  if (!created) {
-    await record.update(payload);
-  }
+    if (!created) {
+      await record.update(payload, { transaction: t });
+    }
 
-  // ── Auto-Sync Shift Petty Cash into Unified transactions (Day Book) ──
-  // 1. Delete previously synced transactions for this shift to prevent duplicate entries
-  await Transaction.destroy({
-    where: {
-      reference_type: 'SHIFT_EXPENSE',
-      reference_id: record.id,
-    },
-  });
-
-  // 2. Re-insert each shift expense as a verified Day Book cash expense voucher
-  if (expensesList.length > 0) {
-    const allCategories = await Category.findAll({ where: { type: 'EXPENSE' } });
-    const allVendors = await Vendor.findAll();
-
-    for (let i = 0; i < expensesList.length; i++) {
-      const exp = expensesList[i];
-
-      // Match or find category
-      let matchedCat = allCategories.find(c => 
-        (exp.category_id && c.id === exp.category_id) || 
-        c.name.toLowerCase() === (exp.cat || '').toLowerCase()
-      );
-
-      if (!matchedCat) {
-        matchedCat = await Category.create({
-          name: exp.cat || 'Shift Expense',
-          type: 'EXPENSE',
-          is_active: true,
-        });
-      }
-
-      // Match vendor/staff
-      let matchedVendor = null;
-      if (exp.vendor_id) {
-        matchedVendor = allVendors.find(v => v.id === exp.vendor_id);
-      } else if (exp.to && exp.to.trim()) {
-        const toClean = exp.to.trim().toLowerCase();
-        matchedVendor = allVendors.find(v => v.name.toLowerCase() === toClean);
-      }
-
-      const dateSlug = date.replace(/-/g, '');
-      const voucherNo = `VCH-SE-${dateSlug}-${i + 1}-${Date.now().toString().slice(-4)}`;
-
-      await Transaction.create({
-        voucher_no: voucherNo,
-        transaction_date: date,
-        category_id: matchedCat.id,
-        vendor_id: matchedVendor ? matchedVendor.id : null,
-        amount: exp.amt,
-        payment_mode: 'CASH', // Paid out of shift cash drawer
+    // ── Auto-Sync Shift Petty Cash into Unified transactions (Day Book) ──
+    // 1. Delete previously synced transactions for this shift to prevent duplicate entries
+    await Transaction.destroy({
+      where: {
         reference_type: 'SHIFT_EXPENSE',
         reference_id: record.id,
-        description: `[SHIFT EXPENSE] ${exp.desc || exp.cat}${exp.to ? ` (Paid to: ${exp.to})` : ''}`,
-        created_by: userId || null,
-      });
+      },
+      transaction: t,
+    });
+
+    // 2. Re-insert each shift expense as a verified Day Book cash expense voucher
+    if (expensesList.length > 0) {
+      const allCategories = await Category.findAll({ where: { type: 'EXPENSE' }, transaction: t });
+      const allVendors = await Vendor.findAll({ transaction: t });
+
+      for (let i = 0; i < expensesList.length; i++) {
+        const exp = expensesList[i];
+
+        // Match or find category
+        let matchedCat = allCategories.find(c => 
+          (exp.category_id && c.id === exp.category_id) || 
+          c.name.toLowerCase() === (exp.cat || '').toLowerCase()
+        );
+
+        if (!matchedCat) {
+          matchedCat = await Category.create({
+            name: exp.cat || 'Shift Expense',
+            type: 'EXPENSE',
+            is_active: true,
+          }, { transaction: t });
+          allCategories.push(matchedCat);
+        }
+
+        // Match vendor/staff
+        let matchedVendor = null;
+        if (exp.vendor_id) {
+          matchedVendor = allVendors.find(v => v.id === exp.vendor_id);
+        } else if (exp.to && exp.to.trim()) {
+          const toClean = exp.to.trim().toLowerCase();
+          matchedVendor = allVendors.find(v => v.name.toLowerCase() === toClean);
+        }
+
+        const dateSlug = date.replace(/-/g, '');
+        const voucherNo = `VCH-SE-${dateSlug}-${i + 1}-${Date.now().toString().slice(-4)}`;
+
+        await Transaction.create({
+          voucher_no: voucherNo,
+          transaction_date: date,
+          category_id: matchedCat.id,
+          vendor_id: matchedVendor ? matchedVendor.id : null,
+          amount: exp.amt,
+          payment_mode: 'CASH', // Paid out of shift cash drawer
+          reference_type: 'SHIFT_EXPENSE',
+          reference_id: record.id,
+          description: `[SHIFT EXPENSE] ${exp.desc || exp.cat}${exp.to ? ` (Paid to: ${exp.to})` : ''}`,
+          created_by: userId || null,
+        }, { transaction: t });
+      }
     }
-  }
+  });
 
   return getByDate(date);
 };
@@ -334,15 +340,19 @@ const deleteDay = async (date) => {
   const row = await DailyDaybook.findOne({ where: { entry_date: date } });
   if (!row) throw new NotFoundError('Day Book entry not found');
 
-  // Also clean up synced shift expense vouchers in transactions table
-  await Transaction.destroy({
-    where: {
-      reference_type: 'SHIFT_EXPENSE',
-      reference_id: row.id,
-    },
+  await sequelize.transaction(async (t) => {
+    // Also clean up synced shift expense vouchers in transactions table
+    await Transaction.destroy({
+      where: {
+        reference_type: 'SHIFT_EXPENSE',
+        reference_id: row.id,
+      },
+      transaction: t,
+    });
+
+    await row.destroy({ transaction: t });
   });
 
-  await row.destroy();
   return { message: `Day Book for ${date} and synced shift vouchers deleted successfully` };
 };
 

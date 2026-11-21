@@ -1,4 +1,4 @@
-const { Loan, Vendor, Category, Transaction } = require('../models');
+const { sequelize, Loan, Vendor, Category, Transaction } = require('../models');
 const { Op } = require('sequelize');
 const { NotFoundError, ValidationError } = require('../utils/AppError');
 const { getPagination, buildMeta, getSortOrder } = require('../utils/pagination');
@@ -114,49 +114,55 @@ const getById = async (id) => {
  * Zero duplicate tables needed.
  */
 const create = async (data, createdBy) => {
-  const loan = await Loan.findByPk(data.loan_id);
-  if (!loan) throw new NotFoundError('Loan not found');
-  if (loan.status === 'CLOSED') throw new ValidationError('Cannot add transactions to a closed loan');
+  return await sequelize.transaction(async (t) => {
+    const loan = await Loan.findByPk(data.loan_id, { transaction: t });
+    if (!loan) throw new NotFoundError('Loan not found');
+    if (loan.status === 'CLOSED') throw new ValidationError('Cannot add transactions to a closed loan');
 
-  const isGiven = loan.loan_type === 'GIVEN';
-  const categoryType =
-    (isGiven && data.type === 'REPAYMENT') || (!isGiven && data.type === 'DISBURSEMENT')
-      ? 'INCOME'
-      : 'EXPENSE';
+    const isGiven = loan.loan_type === 'GIVEN';
+    const categoryType =
+      (isGiven && data.type === 'REPAYMENT') || (!isGiven && data.type === 'DISBURSEMENT')
+        ? 'INCOME'
+        : 'EXPENSE';
 
-  let categoryId = data.category_id;
-  if (!categoryId) {
-    const [cat] = await Category.findOrCreate({
-      where:    { name: 'Loan', type: categoryType },
-      defaults: { name: 'Loan', type: categoryType, is_active: true },
-    });
-    categoryId = cat.id;
-  }
+    let categoryId = data.category_id;
+    if (!categoryId) {
+      const [cat] = await Category.findOrCreate({
+        where:    { name: 'Loan', type: categoryType },
+        defaults: { name: 'Loan', type: categoryType, is_active: true },
+        transaction: t,
+      });
+      categoryId = cat.id;
+    }
 
-  const prefix = `[${data.type}]`;
-  const desc = data.remarks ? `${prefix} ${data.remarks}` : `${prefix} Loan ${data.type.toLowerCase()}`;
+    const prefix = `[${data.type}]`;
+    const desc = data.remarks ? `${prefix} ${data.remarks}` : `${prefix} Loan ${data.type.toLowerCase()}`;
 
-  const txn = await transactionService.create(
-    {
-      transaction_date: data.transaction_date,
-      category_id:      categoryId,
-      vendor_id:        loan.vendor_id,
-      amount:           data.amount,
-      payment_mode:     data.payment_mode ?? 'CASH',
-      reference_type:   'LOAN',
-      reference_id:     loan.id,
-      description:      desc,
-    },
-    createdBy
-  );
+    const txn = await transactionService.create(
+      {
+        transaction_date: data.transaction_date,
+        category_id:      categoryId,
+        vendor_id:        loan.vendor_id,
+        amount:           data.amount,
+        payment_mode:     data.payment_mode ?? 'CASH',
+        reference_type:   'LOAN',
+        reference_id:     loan.id,
+        description:      desc,
+      },
+      createdBy,
+      t
+    );
 
-  return getById(txn.id);
+    return getById(txn.id);
+  });
 };
 
 const remove = async (id) => {
-  const txn = await Transaction.findOne({ where: { id, reference_type: 'LOAN' } });
-  if (!txn) throw new NotFoundError('Loan transaction not found');
-  await txn.destroy();
+  await sequelize.transaction(async (t) => {
+    const txn = await Transaction.findOne({ where: { id, reference_type: 'LOAN' }, transaction: t });
+    if (!txn) throw new NotFoundError('Loan transaction not found');
+    await txn.destroy({ transaction: t });
+  });
 };
 
 module.exports = { list, getById, create, remove };
